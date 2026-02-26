@@ -770,13 +770,10 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # 順伝播
-            debug_every = 100
-            debug_now = (global_step % debug_every == 0)
             loss, loss_gt, loss_teacher = model(
                 observation,
                 actions,
                 teacher=teacher_model,
-                debug=debug_now,
             )
 
             # 逆伝播
@@ -819,7 +816,6 @@ def train_loop(config: _config.TrainConfig):
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
-                # ログ間隔での統計の平均を計算
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 

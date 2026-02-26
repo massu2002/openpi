@@ -2,7 +2,6 @@ import logging
 import math
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
@@ -657,180 +656,70 @@ class PI0Pytorch(nn.Module):
 class DistilledPI0Pytorch(PI0Pytorch):
     def __init__(self, config):
         super().__init__(config)
-        
-        try:
-            self.loss_action_dim = int(len(config.data_config.norm_stats["actions"].mean))
-        except Exception:
-            self.loss_action_dim = 7
 
-    def forward(
-        self,
-        observation,
-        actions,
-        teacher: "PI0Pytorch",
-        noise=None,
-        time=None,
-        *,
-        debug=False,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, observation, actions, teacher: PI0Pytorch, noise=None, time=None) -> Tensor:
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
-        # ---- rank0 判定（DDPでなければ常にTrue）----
-        rank0 = True
-        if dist.is_available() and dist.is_initialized():
-            rank0 = (dist.get_rank() == 0)
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
 
-        # ---- debug の決定：rank0以外は強制的にFalse ----
-        if debug is None:
-            debug = self.debug
-        else:
-            debug = bool(debug)
-        debug = debug and rank0
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
 
-        old_debug = self.debug
-        self.debug = debug
 
-        # rank0 のときだけ call_id を進めてヘッダ出力
-        if self.debug:
-            self._debug_call_id += 1
-            self._dbg_header(
-                f"DistilledPI0Pytorch.forward call_id={self._debug_call_id} train={self.training} pi05={self.pi05}"
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        with torch.no_grad():
+            v_t_teacher = teacher.eval_model(observation, actions, noise, time)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        # Prepare attention masks
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        # Apply gradient checkpointing if enabled
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
             )
+            return suffix_out
 
-        try:
-            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
-                observation, train=True
-            )
+        suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
 
-            if self.debug:
-                self._dbg("行動（actions）", actions)
-                self._dbg("状態（state）", state)
-                self._dbg("画像（リスト）", images)
-                self._dbg("画像マスク（リスト）", img_masks)
-                self._dbg("言語トークン", lang_tokens)
-                self._dbg("言語マスク（リスト）", lang_masks)
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
 
-            if noise is None:
-                noise = self.sample_noise(actions.shape, actions.device)
-                if self.debug:
-                    self._dbg("ノイズ（サンプリング）", noise)
-            else:
-                if self.debug:
-                    self._dbg("ノイズ（与えられた値）", noise)
+        # Apply gradient checkpointing to final action projection if enabled
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
 
-            if time is None:
-                time = self.sample_time(actions.shape[0], actions.device)
-                if self.debug:
-                    self._dbg("拡散回数（サンプリング）", time)
-            else:
-                if self.debug:
-                    self._dbg("拡散回数（与えられた値）", time)
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-            time_expanded = time[:, None, None]
-            x_t = time_expanded * noise + (1 - time_expanded) * actions
-            u_t = noise - actions
-            
-            # 教師モデルの出力
-            with torch.no_grad():
+        loss_output_gt = F.mse_loss(u_t, v_t, reduction="mean")
+        loss_output_teacher = F.mse_loss(v_t_teacher, v_t, reduction="mean")
 
-                p_emb_t, p_pad_t, p_att_t = teacher.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-                s_emb_t, s_pad_t, s_att_t, adarms_t = teacher.embed_suffix(state, x_t, time)
-
-                if teacher.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-                    p_emb_t = p_emb_t.to(torch.bfloat16)
-                    s_emb_t = s_emb_t.to(torch.bfloat16)
-
-                pad_t = torch.cat([p_pad_t, s_pad_t], dim=1)
-                att_t = torch.cat([p_att_t, s_att_t], dim=1)
-                att2d_t = make_att_2d_masks(pad_t, att_t)
-                pos_t = torch.cumsum(pad_t, dim=1) - 1
-                att4d_t = teacher._prepare_attention_masks_4d(att2d_t)
-
-                (_, s_out_t), _ = teacher.paligemma_with_expert.forward(
-                    attention_mask=att4d_t,
-                    position_ids=pos_t,
-                    past_key_values=None,
-                    inputs_embeds=[p_emb_t, s_emb_t],
-                    use_cache=False,
-                    adarms_cond=[None, adarms_t],
-                )
-
-                s_out_t = s_out_t[:, -teacher.config.action_horizon:].to(torch.float32)
-                v_t_teacher = teacher.action_out_proj(s_out_t).to(device=actions.device, dtype=torch.float32)
-                
-                if self.debug:
-                    self._dbg("教師出力（v_t_teacher）", v_t_teacher)
-
-            v_t_teacher = v_t_teacher.to(device=actions.device, dtype=torch.float32)
-
-            # 生徒モデルの出力
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
-
-            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-
-            if (
-                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-                == torch.bfloat16
-            ):
-                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-            position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-            # トランスフォーマーの順伝播
-            def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-                (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                    attention_mask=att_2d_masks_4d,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    inputs_embeds=[prefix_embs, suffix_embs],
-                    use_cache=False,
-                    adarms_cond=[None, adarms_cond],
-                )
-                return suffix_out
-
-            suffix_out = self._apply_checkpoint(
-                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-            )
-
-            suffix_out = suffix_out[:, -self.config.action_horizon :]
-            suffix_out = suffix_out.to(dtype=torch.float32)
-
-            def action_out_proj_func(suffix_out):
-                return self.action_out_proj(suffix_out)
-
-            v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-            
-            if self.debug:
-                self._dbg("生徒出力（v_t）", v_t)
-                
-            action_dim = int(self.loss_action_dim)
-
-            u_t_valid = u_t[..., :action_dim]
-            v_t_valid = v_t[..., :action_dim]
-            v_t_teacher_valid = v_t_teacher[..., :action_dim]
-
-            loss_output_gt = F.mse_loss(u_t_valid, v_t_valid, reduction="mean")
-            loss_output_teacher = F.mse_loss(v_t_teacher_valid, v_t_valid, reduction="mean")
-
-            if self.debug:
-                with torch.no_grad():
-                    print("=== 出力のMSE（有効な次元のみ） ===")
-                    print(u_t_valid.shape)
-                    print(v_t_teacher_valid.shape)
-                    mse_u = F.mse_loss(u_t_valid, v_t_teacher_valid, reduction="mean")
-                    mse_neg_u = F.mse_loss(u_t_valid, -v_t_teacher_valid, reduction="mean")
-                print("教師とラベルの出力のMSE:", mse_u, "教師とラベルの出力のMSE（符号反転）:", mse_neg_u)
-
-            loss = loss_output_gt + loss_output_teacher
-            return loss, loss_output_gt, loss_output_teacher
-        finally:
-            self.debug = old_debug
+        return loss_output_gt + loss_output_teacher, loss_output_gt, loss_output_teacher
 

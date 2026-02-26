@@ -4,17 +4,19 @@ import json
 import logging
 import math
 import pathlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+import pathlib
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+import copy
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -22,46 +24,99 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 @dataclasses.dataclass
 class Args:
-    #################################################################################################################
     # Model server parameters
-    #################################################################################################################
     host: str = "0.0.0.0"
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5
 
-    #################################################################################################################
     # LIBERO environment-specific parameters
-    #################################################################################################################
     task_suites: Tuple[str, ...] = (
         "libero_spatial",
         "libero_object",
         "libero_goal",
         "libero_10",
-        # "libero_90",
     )
-    
-    task_suite_name: str = "libero_spatial"
-    # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+    task_suite_name: str = "libero_spatial"  # 1つだけ指定する場合の引数（複数指定の task_suites と両方書かれたときは task_suites が優先される）
 
-    num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_steps_wait: int = 10
+    num_trials_per_task: int = 50
 
-    #################################################################################################################
     # Multi-seed
-    #################################################################################################################
-    seeds: Tuple[int, ...] = (7, 8, 9)  # 複数シード
+    seeds: Tuple[int, ...] = (7, 8, 9)
+    result_root: str = "AUTO"
 
-    #################################################################################################################
-    # Output root
-    #################################################################################################################
-    result_root: str = "result/libero"  # result/libero/{task_suite}/(json|videos)
+def _derive_result_root_from_checkpoint_dir(ckpt_dir: str) -> str:
+    """
+    例:
+      ckpt:   ./checkpoints/teacher/pi05_libero/fineturne_libero/seed7/30000
+      result: ./result/libero/teacher/pi05_libero/finetune_libero/seed7/30000
+    """
+    s = ckpt_dir.replace("\\", "/")
 
-    #################################################################################################################
-    # Utils
-    #################################################################################################################
-    seed: int = 7  # (単一seed評価のときに使用; multi-seedでは内部で上書き)
+    if s.startswith("./"):
+        s_rel = s[2:]
+    else:
+        s_rel = s
 
+    if s_rel.startswith("checkpoints/"):
+        s_rel = s_rel[len("checkpoints/") :]
+
+    s_rel = s_rel.replace("fineturne_libero", "finetune_libero")
+
+    return "./" + str(pathlib.Path("result/libero") / s_rel)
+
+def _resolve_result_root_from_server(args: Args) -> str:
+    if args.result_root != "AUTO":
+        return args.result_root
+
+    ws = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    md = ws.get_server_metadata()  # ★サーバから metadata 取得 :contentReference[oaicite:2]{index=2}
+
+    ckpt_dir = md.get("ckpt_dir")
+    if not ckpt_dir:
+        raise RuntimeError(
+            f"Server metadata does not include 'ckpt_dir'. metadata={md}"
+        )
+
+    return _derive_result_root_from_checkpoint_dir(str(ckpt_dir))
+
+def _fetch_server_metadata(args: "Args") -> Dict[str, Any]:
+    """
+    WebSocket サーバの metadata から、評価JSONに入れたい情報を抽出して返す。
+    最低でも ckpt_dir, ckpt_config を入れる（無い場合は None）。
+    """
+    try:
+        c = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+        md = c.get_server_metadata()
+        if not isinstance(md, dict):
+            return {"ckpt_dir": None, "ckpt_config": None, "_raw": str(md)}
+    except Exception as e:
+        logging.warning(f"Failed to fetch server metadata: {e}")
+        return {"ckpt_dir": None, "ckpt_config": None, "_error": str(e)}
+
+    keep_keys = ("ckpt_dir", "ckpt_config", "ckpt_source", "env_mode", "train_seed")
+    out = {k: md.get(k, None) for k in keep_keys}
+
+    # もし将来必要になったら丸ごと保存できる（今は肥大化防止で入れない）
+    # out["_full"] = md
+
+    return out
+
+def _resolve_result_root_from_server_md(args: "Args", server_md: Dict[str, Any]) -> str:
+    """
+    result_root=AUTO のとき、server_md["ckpt_dir"] から result_root を導出する。
+    """
+    if args.result_root != "AUTO":
+        return args.result_root
+
+    ckpt_dir = server_md.get("ckpt_dir")
+    if not ckpt_dir:
+        raise RuntimeError(
+            "result_root is AUTO but server metadata does not contain ckpt_dir. "
+            f"server_metadata={server_md}"
+        )
+    return _derive_result_root_from_checkpoint_dir(str(ckpt_dir))
 
 def _max_steps_for_suite(task_suite_name: str) -> int:
     if task_suite_name == "libero_spatial":
@@ -77,7 +132,7 @@ def _max_steps_for_suite(task_suite_name: str) -> int:
     raise ValueError(f"Unknown task suite: {task_suite_name}")
 
 
-def eval_libero_seed(args: Args, *, seed: int) -> Dict[str, Any]:
+def eval_libero_seed(args: Args, *, seed: int, server_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     1つの seed で task_suite を全タスク評価し、結果dictを返す（保存は呼び出し側）。
     JSON構造：
@@ -247,6 +302,7 @@ def eval_libero_seed(args: Args, *, seed: int) -> Dict[str, Any]:
     out = {
         "task_suite": str(args.task_suite_name),
         "seed": int(seed),
+        "server_metadata": copy.deepcopy(server_metadata) if server_metadata is not None else None,
         "suite_summary": {
             "num_tasks": int(num_tasks_in_suite),
             "num_trials_per_task": int(args.num_trials_per_task),
@@ -261,12 +317,16 @@ def eval_libero_seed(args: Args, *, seed: int) -> Dict[str, Any]:
 
 def eval_libero_multi_seed(args: Args) -> None:
     """
-    複数seedを回して:
-      - result/libero/{suite}/json/result_{seed}.json
-      - result/libero/{suite}/json/result.json (seed平均)
-    を作る。
+    複数 eval_seed を回して:
+      - {result_root}/{suite}/json/result_{eval_seed}.json
+      - {result_root}/{suite}/json/result.json (eval_seed平均)
+    を作る。result_root は ckpt_dir（サーバmetadata）由来で AUTO 生成できる。
+    さらに保存JSONに server_metadata（ckpt_dir, ckpt_config など）を埋め込む。
     """
-    suite_dir = pathlib.Path(args.result_root) / args.task_suite_name
+    server_md = _fetch_server_metadata(args)
+    resolved_root = _resolve_result_root_from_server_md(args, server_md)
+
+    suite_dir = pathlib.Path(resolved_root) / args.task_suite_name
     json_dir = suite_dir / "json"
     video_dir = suite_dir / "videos"
     json_dir.mkdir(parents=True, exist_ok=True)
@@ -274,17 +334,21 @@ def eval_libero_multi_seed(args: Args) -> None:
 
     seed_results: Dict[int, Dict[str, Any]] = {}
 
-    for seed in args.seeds:
-        r = eval_libero_seed(args, seed=seed)
-        seed_results[int(seed)] = r
+    for eval_seed in args.seeds:
+        args_run = dataclasses.replace(args, result_root=resolved_root)
 
-        # write seed json
-        out_path = json_dir / f"result_{int(seed)}.json"
+        r = eval_libero_seed(args_run, seed=int(eval_seed), server_metadata=server_md)
+        seed_results[int(eval_seed)] = r
+
+        out_path = json_dir / f"result_{int(eval_seed)}.json"
         _write_json(out_path, r)
         logging.info(f"Wrote: {out_path}")
 
-    # build averaged result.json
     avg = _aggregate_seed_results(args.task_suite_name, args.num_trials_per_task, seed_results)
+
+    avg["server_metadata"] = copy.deepcopy(server_md)
+    avg["result_root"] = str(resolved_root)
+
     out_path = json_dir / "result.json"
     _write_json(out_path, avg)
     logging.info(f"Wrote: {out_path}")

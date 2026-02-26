@@ -766,7 +766,6 @@ _CONFIGS = [
         name="pi0_libero_distill_6",
         wandb_enabled=False,
         model=pi0_config.DistilledPi0Config(
-            action_dim=32,
             teacher_config="pi0_libero",
             gemma_depth=6
         ),
@@ -775,10 +774,9 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        pytorch_weight_path="./checkpoints/teacher/pi05_libero/fineturne_libero/30000",
+        pytorch_weight_path="./checkpoints/teacher/pi05_libero/fineturne_libero/seed43/30000",
         num_train_steps=30_000,
         batch_size=64,
-        save_interval=10_000,
         checkpoint_base_dir="./checkpoints/student",
         pytorch_training_precision="float32",
     ),
@@ -786,7 +784,6 @@ _CONFIGS = [
         name="pi0_libero_distill_9",
         wandb_enabled=False,
         model=pi0_config.DistilledPi0Config(
-            action_dim=32,
             teacher_config="pi0_libero",
             gemma_depth=9
         ),
@@ -798,7 +795,7 @@ _CONFIGS = [
         pytorch_weight_path="./checkpoints/teacher/pi05_libero/fineturne_libero/30000",
         num_train_steps=30_000,
         batch_size=64,
-        save_interval=10_000,
+        checkpoint_base_dir="./checkpoints/student",
         pytorch_training_precision="float32",
     ),
     TrainConfig(
@@ -820,7 +817,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         batch_size=64,
         num_train_steps=30_000,
-        log_interval=10_000,
         checkpoint_base_dir="./checkpoints/teacher"
     ),
     #
