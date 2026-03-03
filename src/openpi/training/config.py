@@ -509,6 +509,8 @@ class TrainConfig:
     num_workers: int = 1
     # 学習ステップ数を設定
     num_train_steps: int = 30_000
+    # マイクロバッチサイズを設定
+    microbatch_size: int = 4
 
     # 学習の進捗をログに出力する頻度（ステップ数）を設定
     log_interval: int = 100
@@ -722,7 +724,7 @@ _CONFIGS = [
         name="pi0_libero_distill_6",
         wandb_enabled=False,
         model=pi0_config.DistilledPi0Config(
-            teacher_config="pi0_libero",
+            teacher_config="pi05_libero",
             gemma_depth=6
         ),
         data=LeRobotLiberoDataConfig(
@@ -733,25 +735,8 @@ _CONFIGS = [
         pytorch_weight_path="./checkpoints/foundation/pi05_libero/pytorch",
         num_train_steps=30_000,
         batch_size=64,
+        microbatch_size=4,
         save_interval=10_000,
-        checkpoint_base_dir="./checkpoints/student",
-        pytorch_training_precision="float32",
-    ),
-    TrainConfig(
-        name="pi0_libero_distill_9",
-        wandb_enabled=False,
-        model=pi0_config.DistilledPi0Config(
-            teacher_config="pi0_libero",
-            gemma_depth=9
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
-        ),
-        pytorch_weight_path="./checkpoints/teacher/pi05_libero/fineturne_libero/30000",
-        num_train_steps=30_000,
-        batch_size=64,
         checkpoint_base_dir="./checkpoints/student",
         pytorch_training_precision="float32",
     ),

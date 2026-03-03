@@ -517,26 +517,35 @@ class DistilledPI0Pytorch(PI0Pytorch):
     def __init__(self, config):
         super().__init__(config)
 
-    def forward(self, observation, actions, teacher: PI0Pytorch, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def forward(self, observation, actions, teacher=None, noise=None, time=None) -> Tensor:
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
-
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        exp_name = str(getattr(self.config, "exp_name", "") or "").lower()
+        use_only_gt = ("only_gt" in exp_name)
+        use_only_teacher = ("only_teacher" in exp_name) and (not use_only_gt)
+        use_gt_teacher = (("gt_teacher" in exp_name) or ("teacher" in exp_name)) and (not use_only_gt) and (not use_only_teacher)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        with torch.no_grad():
-            v_t_teacher = teacher.eval_model(observation, actions, noise, time)
+        need_teacher = use_only_teacher or use_gt_teacher
+        v_t_teacher = None
+        if need_teacher:
+            if teacher is None:
+                raise ValueError("exp_name requires teacher ('only_teacher' or 'gt_teacher'), but teacher is None.")
+            with torch.inference_mode():
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                    v_t_teacher = teacher.eval_model(observation, actions, noise, time)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -549,11 +558,8 @@ class DistilledPI0Pytorch(PI0Pytorch):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
@@ -572,13 +578,23 @@ class DistilledPI0Pytorch(PI0Pytorch):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         loss_output_gt = F.mse_loss(u_t, v_t, reduction="mean")
-        loss_output_teacher = F.mse_loss(v_t_teacher, v_t, reduction="mean")
 
-        return loss_output_gt + loss_output_teacher, loss_output_gt, loss_output_teacher
+        if v_t_teacher is None:
+            loss_output_teacher = loss_output_gt.new_zeros(())
+        else:
+            loss_output_teacher = F.mse_loss(v_t_teacher, v_t, reduction="mean")
+
+        if use_only_gt:
+            total_loss = loss_output_gt
+        elif use_only_teacher:
+            total_loss = loss_output_teacher
+        else:
+            total_loss = loss_output_gt + loss_output_teacher
+
+        return total_loss, loss_output_gt, loss_output_teacher

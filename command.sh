@@ -21,7 +21,7 @@ set -euo pipefail
 # 教師モデルの学習コマンド
 # ======================
 
-PEAK_LRS=(7e-5 3.5e-5)
+PEAK_LRS=(4e-5)
 # PEAK_LRS=(2.5e-5 5e-5 1e-4)
 SEED=42
 EXP_BASE="finetune_libero"
@@ -65,19 +65,12 @@ done
 
 # 6層のモデルに蒸留
 # .venv/bin/python scripts/compute_norm_stats.py --config-name=pi0_libero_distill_6
-# peak_lr=3e-6
-# decay_lr=$(./.venv/bin/python - <<PY
-# lr=float("${peak_lr}")
-# print(lr/10.0)
-# PY
-# )
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128 \
 # ./.venv/bin/python -m torch.distributed.run \
 #   --standalone --nnodes=1 --nproc_per_node=4 \
 #   scripts/distill_pytorch.py pi0_libero_distill_6 \
-#   --exp_name libero_distill_6 \
-#   --seed 43 \
-#   --lr_schedule.peak_lr "${peak_lr}" \
-#   --lr_schedule.decay_lr "${decay_lr}" \
+#   --exp_name only_teacher \
+#   --seed 43
 
 
 # ======================

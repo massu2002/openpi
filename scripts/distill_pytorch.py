@@ -36,13 +36,18 @@ import jax
 import numpy as np
 import matplotlib.pyplot as plt
 import safetensors.torch
+import math
+import contextlib
 import torch
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
 import wandb
 from dataclasses import dataclass, field
+import bitsandbytes as bnb
+from torch.distributed.optim import ZeroRedundancyOptimizer
 from pathlib import Path
+from torch import amp
 from typing import List, Optional, Dict, Any
 
 import openpi.models.pi0_config
@@ -336,7 +341,7 @@ def _count_params(model: torch.nn.Module) -> tuple[int, int]:
 
 def log_student_teacher_params(
     student_model: torch.nn.Module,
-    teacher_model: torch.nn.Module,
+    teacher_model: Optional[torch.nn.Module],
     *,
     is_main: bool = True,
     logger: logging.Logger | None = None,
@@ -348,10 +353,7 @@ def log_student_teacher_params(
         logger = logging.getLogger(__name__)
 
     s_total, s_train = _count_params(student_model)
-    t_total, t_train = _count_params(teacher_model)
-
     s_ratio = (s_train / s_total * 100.0) if s_total > 0 else 0.0
-    t_ratio = (t_train / t_total * 100.0) if t_total > 0 else 0.0
 
     logger.info("============================================================")
     logger.info(f"{title}")
@@ -360,10 +362,17 @@ def log_student_teacher_params(
         f"生徒モデル: 総 { _format_num_mb(s_total) } ({s_total:,}) | "
         f"学習 { _format_num_mb(s_train) } ({s_train:,}) | 学習率 {s_ratio:.2f}%"
     )
-    logger.info(
-        f"教師モデル: 総 { _format_num_mb(t_total) } ({t_total:,}) | "
-        f"学習 { _format_num_mb(t_train) } ({t_train:,}) | 学習率 {t_ratio:.2f}%"
-    )
+
+    if teacher_model is None:
+        logger.info("教師モデル: なし (teacher_model=None)")
+    else:
+        t_total, t_train = _count_params(teacher_model)
+        t_ratio = (t_train / t_total * 100.0) if t_total > 0 else 0.0
+        logger.info(
+            f"教師モデル: 総 { _format_num_mb(t_total) } ({t_total:,}) | "
+            f"学習 { _format_num_mb(t_train) } ({t_train:,}) | 学習率 {t_ratio:.2f}%"
+        )
+
     logger.info("============================================================")
     
 @dataclass
@@ -475,7 +484,7 @@ def make_loss_plot_path(config, exp_checkpoint_dir: Path) -> Path:
     return "student"/ exp_checkpoint_dir / "loss_curves.png"
 
 
-# =========================
+# ========================
 # メイン学習ループ
 # ========================
 def train_loop(config: _config.TrainConfig):
@@ -566,27 +575,29 @@ def train_loop(config: _config.TrainConfig):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    # 教師モデルを構築（重みは後で読み込む）
+    # モデルを構築
     model = openpi.models_pytorch.pi0_pytorch.DistilledPI0Pytorch(model_cfg).to(device)
     assert hasattr(model_cfg, "teacher_config")
     assert hasattr(config, "pytorch_weight_path_teacher")
     teacher_config = _config.get_config(model_cfg.teacher_config).model
     object.__setattr__(teacher_config, "dtype", config.pytorch_training_precision)
-    teacher_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(teacher_config).to(device)
-    teacher_model.eval()
 
-    # 教師モデルをファインチューニングした重みで初期化
+    # 教師モデルを構築
     teacher_model_weight_path = config.pytorch_weight_path if \
         config.pytorch_weight_path_teacher is None \
             else config.pytorch_weight_path_teacher
     teacher_model_path = os.path.join(teacher_model_weight_path, "model.safetensors")
-    safetensors.torch.load_model(
-        teacher_model, teacher_model_path, strict=False
-    )
-    logging.info(f"教師モデルの重みを読み込みました: {teacher_model_path}")
-    teacher_model = teacher_model.eval()
-    teacher_model = freeze_module(teacher_model)
-    assert not any(p.requires_grad for p in teacher_model.parameters())
+    exp_name = str(getattr(config, "exp_name", "") or "").lower()
+    need_teacher = ("only_gt" not in exp_name)
+
+    # 教師モデルの重みを読み込んで初期化する。教師モデルは学習させない（freeze）する。
+    teacher_model = None
+    if need_teacher:
+        teacher_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(teacher_config).to(device)
+        safetensors.torch.load_model(teacher_model, teacher_model_path, strict=True)
+        teacher_model.eval()
+        teacher_model = freeze_module(teacher_model)
+        assert not any(p.requires_grad for p in teacher_model.parameters())
 
     # gradient checkpointing をサポートしている場合は有効化（大規模モデルのメモリ最適化に有効）
     if hasattr(model, "gradient_checkpointing_enable"):
@@ -656,8 +667,10 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # 最適化関数の構築
-    optim = torch.optim.AdamW(
-        model.parameters(),
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optim = ZeroRedundancyOptimizer(
+        trainable_params,
+        optimizer_class=torch.optim.AdamW,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -727,64 +740,100 @@ def train_loop(config: _config.TrainConfig):
     # -------------
     # 学習ループ開始
     # -------------
+    micro_bs = getattr(config, "microbatch_size", 4)
+    use_amp = torch.cuda.is_available()
+    amp_dtype = torch.bfloat16 if str(getattr(config, "dtype", "bfloat16")).lower() in ["bf16", "bfloat16"] else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+    
+    def tree_slice(batch_tree, sl):
+        return jax.tree.map(lambda x: x[sl] if torch.is_tensor(x) and x.ndim >= 1 else x, batch_tree)
+    
     while global_step < config.num_train_steps:
-        # 分散学習用にエポックを設定
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
         for observation, actions in loader:
-            # 学習ステップが最大に達したら終了
             if global_step >= config.num_train_steps:
                 break
 
-            # 統一されたデータローダーから (observation, actions) を取得
-            observation = jax.tree.map(lambda x: x.to(device), observation)
             actions = actions.to(torch.float32)
-            actions = actions.to(device)
 
-            # 学習率を更新
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # 順伝播
-            loss, loss_gt, loss_teacher = model(
-                observation,
-                actions,
-                teacher=teacher_model,
-            )
+            B = actions.shape[0]
+            if micro_bs <= 0:
+                micro_bs = B
+            accum_steps = math.ceil(B / micro_bs)
 
-            # 逆伝播
-            loss.backward()
-
-            # メモリの使用量をログ出力（最初の数ステップのみ）
-            if global_step < 5 and is_main and torch.cuda.is_available():
-                log_memory_usage(device, global_step, "after_backward")
-
-            # 勾配クリッピング
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
-
-            # パラメータ更新
-            optim.step()
             optim.zero_grad(set_to_none=True)
 
-            # 勾配をより積極的にクリア
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+            loss_sum = 0.0
+            loss_gt_sum = 0.0
+            loss_teacher_sum = 0.0
 
-            # 統計を収集
+            for mb_start in range(0, B, micro_bs):
+                mb_end = min(B, mb_start + micro_bs)
+                sl = slice(mb_start, mb_end)
+
+                obs_mb = tree_slice(observation, sl)
+                act_mb = actions[sl]
+                
+                obs_mb = jax.tree.map(lambda x: x.to(device, non_blocking=True), obs_mb)
+                act_mb = act_mb.to(device, non_blocking=True)
+                
+                is_last = (mb_end == B)
+                sync_ctx = contextlib.nullcontext()
+                if use_ddp and hasattr(model, "no_sync") and (not is_last):
+                    sync_ctx = model.no_sync()
+
+                with sync_ctx:
+                    with amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                        loss, loss_gt, loss_teacher = model(
+                            obs_mb,
+                            act_mb,
+                            teacher=teacher_model,
+                        )
+                        loss_scaled = loss / accum_steps
+
+                    if scaler.is_enabled():
+                        scaler.scale(loss_scaled).backward()
+                    else:
+                        loss_scaled.backward()
+
+                loss_sum += float(loss.detach().item()) * (mb_end - mb_start)
+                loss_gt_sum += float(loss_gt.detach().item()) * (mb_end - mb_start)
+                loss_teacher_sum += float(loss_teacher.detach().item()) * (mb_end - mb_start)
+
+                del obs_mb, act_mb, loss, loss_gt, loss_teacher, loss_scaled
+
+            if scaler.is_enabled():
+                scaler.unscale_(optim)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+
+            if scaler.is_enabled():
+                scaler.step(optim)
+                scaler.update()
+            else:
+                optim.step()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            optim.zero_grad(set_to_none=True)
+
+            # interval平均の計算と保存
             if is_main:
-                loss_tracker.update(
-                    loss=float(loss.item()),
-                    loss_gt=float(loss_gt.item()),
-                    loss_teacher=float(loss_teacher.item()),
-                )
+                loss_avg = loss_sum / B
+                loss_gt_avg = loss_gt_sum / B
+                loss_teacher_avg = loss_teacher_sum / B
+
+                loss_tracker.update(loss=loss_avg, loss_gt=loss_gt_avg, loss_teacher=loss_teacher_avg)
                 infos.append(
                     {
-                        "loss": float(loss.item()),
-                        "loss_gt": float(loss_gt.item()),
-                        "loss_teacher": float(loss_teacher.item()),
+                        "loss": loss_avg,
+                        "loss_gt": loss_gt_avg,
+                        "loss_teacher": loss_teacher_avg,
                         "learning_rate": float(optim.param_groups[0]["lr"]),
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
                     }
@@ -887,7 +936,7 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {"loss": f"{loss_avg:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
 
     if pbar is not None:
