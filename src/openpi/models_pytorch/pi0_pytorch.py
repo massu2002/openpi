@@ -4,7 +4,7 @@ import math
 import torch
 from torch import Tensor
 from torch import nn
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
@@ -99,7 +99,6 @@ class PI0Pytorch(nn.Module):
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
-        self.action_dim = config.action_dim
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -123,74 +122,6 @@ class PI0Pytorch(nn.Module):
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
-        
-        self.debug = bool(getattr(config, "debug", False))
-        self.debug_detail = int(getattr(config, "debug_detail", 1))
-        self._debug_call_id = 0
-        
-    def set_debug(self, enabled: bool = True, *, detail: int | None = None):
-        """実行中にデバッグON/OFFを切り替え可能にする。"""
-        self.debug = bool(enabled)
-        if detail is not None:
-            self.debug_detail = int(detail)
-
-    def _dynamo_is_compiling(self) -> bool:
-        # torch.compile中にprintすると問題が出ることがあるので回避
-        try:
-            return bool(torch._dynamo.is_compiling())  # type: ignore[attr-defined]
-        except Exception:
-            return False
-
-    def _dbg(self, name: str, x, indent: int = 0):
-        """shape/dtype/device をprintする。dict/list/tuple/tensorに対応。"""
-        if not self.debug:
-            return
-        if self._dynamo_is_compiling():
-            # compile中は黙る（必要ならここで1回だけ警告を出してもOK）
-            return
-
-        pad = "  " * indent
-
-        def _tensor_info(t: torch.Tensor) -> str:
-            s = f"shape={tuple(t.shape)} dtype={str(t.dtype).replace('torch.','')} device={t.device} req_grad={t.requires_grad}"
-            if self.debug_detail >= 2 and t.is_floating_point():
-                with torch.no_grad():
-                    has_nan = torch.isnan(t).any().item()
-                    has_inf = torch.isinf(t).any().item()
-                    finite = torch.isfinite(t)
-                    if finite.any().item():
-                        tmin = t[finite].min().item()
-                        tmax = t[finite].max().item()
-                        s += f" min={tmin:.4g} max={tmax:.4g} nan={has_nan} inf={has_inf}"
-                    else:
-                        s += f" nan={has_nan} inf={has_inf}"
-            return s
-
-        if torch.is_tensor(x):
-            print(f"{pad}[DBG] {name}: {_tensor_info(x)}")
-            return
-
-        if isinstance(x, dict):
-            keys = list(x.keys())
-            print(f"{pad}[DBG] {name}: dict keys={keys}")
-            for k in keys:
-                self._dbg(f"{name}[{k}]", x[k], indent=indent + 1)
-            return
-
-        if isinstance(x, (list, tuple)):
-            print(f"{pad}[DBG] {name}: {type(x).__name__} len={len(x)}")
-            for i, v in enumerate(x):
-                self._dbg(f"{name}[{i}]", v, indent=indent + 1)
-            return
-
-        print(f"{pad}[DBG] {name}: {type(x).__name__} {x}")
-
-    def _dbg_header(self, title: str):
-        if not self.debug or self._dynamo_is_compiling():
-            return
-        print("\n" + "=" * 80)
-        print(f"[DBG] {title}")
-        print("=" * 80)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -227,18 +158,9 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
-    def _preprocess_observation(self, observation, *, train=True, return_dict: bool = False):
+    def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-        observation.state = observation.state.to(dtype=torch.float32)
-        if return_dict:
-            return (
-                observation.images,
-                observation.image_masks,
-                observation.tokenized_prompt,
-                observation.tokenized_prompt_mask,
-                observation.state,
-            )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
@@ -391,126 +313,64 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None, *, debug: bool | None = None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
-        if debug is None:
-            debug = self.debug
-        else:
-            debug = bool(debug)
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
 
-        # forwardごとにデバッグON/OFFを切替できるように一時上書き
-        old_debug = self.debug
-        self.debug = debug
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
 
-        self._debug_call_id += 1
-        self._dbg_header(f"PI0Pytorch.forward call_id={self._debug_call_id} train={self.training} pi05={self.pi05}")
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
 
-        try:
-            # ---- preprocess ----
-            images_d, img_masks_d, lang_tokens, lang_masks, state = self._preprocess_observation(
-                observation, train=True, return_dict=True
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        # Prepare attention masks
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        # Apply gradient checkpointing if enabled
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
             )
-            images = list(images_d.values())
-            img_masks = list(img_masks_d.values())
+            return suffix_out
 
-            self._dbg("actions", actions)
-            self._dbg("images(dict)", images_d)
-            self._dbg("img_masks(dict)", img_masks_d)
-            self._dbg("lang_tokens", lang_tokens)
-            self._dbg("lang_masks", lang_masks)
-            self._dbg("state", state)
+        suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
 
-            # ---- noise/time ----
-            if noise is None:
-                noise = self.sample_noise(actions.shape, actions.device)
-                self._dbg("noise(sampled)", noise)
-            else:
-                self._dbg("noise(given)", noise)
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
 
-            if time is None:
-                time = self.sample_time(actions.shape[0], actions.device)
-                self._dbg("time(sampled)", time)
-            else:
-                self._dbg("time(given)", time)
+        # Apply gradient checkpointing to final action projection if enabled
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
 
-            time_expanded = time[:, None, None]
-            self._dbg("time_expanded", time_expanded)
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-            x_t = time_expanded * noise + (1 - time_expanded) * actions
-            u_t = noise - actions
-            self._dbg("x_t", x_t)
-            self._dbg("u_t", u_t)
-
-            # ---- embeddings ----
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-            self._dbg("prefix_embs", prefix_embs)
-            self._dbg("prefix_pad_masks", prefix_pad_masks)
-            self._dbg("prefix_att_masks", prefix_att_masks)
-
-            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-            self._dbg("suffix_embs(before_cast)", suffix_embs)
-            self._dbg("suffix_pad_masks", suffix_pad_masks)
-            self._dbg("suffix_att_masks", suffix_att_masks)
-            self._dbg("adarms_cond", adarms_cond)
-
-            if (
-                self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-                == torch.bfloat16
-            ):
-                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-                self._dbg("prefix_embs(after_cast)", prefix_embs)
-                self._dbg("suffix_embs(after_cast)", suffix_embs)
-
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-            self._dbg("pad_masks(cat)", pad_masks)
-            self._dbg("att_masks(cat)", att_masks)
-
-            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-            position_ids = torch.cumsum(pad_masks, dim=1) - 1
-            self._dbg("att_2d_masks", att_2d_masks)
-            self._dbg("position_ids", position_ids)
-
-            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-            self._dbg("att_2d_masks_4d", att_2d_masks_4d)
-
-            # ---- transformer forward ----
-            def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-                (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                    attention_mask=att_2d_masks_4d,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    inputs_embeds=[prefix_embs, suffix_embs],
-                    use_cache=False,
-                    adarms_cond=[None, adarms_cond],
-                )
-                return suffix_out
-
-            suffix_out = self._apply_checkpoint(
-                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-            )
-            self._dbg("suffix_out(raw)", suffix_out)
-
-            suffix_out = suffix_out[:, -self.config.action_horizon :]
-            suffix_out = suffix_out.to(dtype=torch.float32)
-            self._dbg("suffix_out(cropped_float32)", suffix_out)
-
-            def action_out_proj_func(suffix_out):
-                return self.action_out_proj(suffix_out)
-
-            v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-            self._dbg("v_t", v_t)
-
-            loss = F.mse_loss(u_t, v_t, reduction="none")
-            self._dbg("loss", loss)
-
-            return loss
-
-        finally:
-            # debug状態を戻す
-            self.debug = old_debug
+        return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -722,4 +582,3 @@ class DistilledPI0Pytorch(PI0Pytorch):
         loss_output_teacher = F.mse_loss(v_t_teacher, v_t, reduction="mean")
 
         return loss_output_gt + loss_output_teacher, loss_output_gt, loss_output_teacher
-

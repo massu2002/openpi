@@ -299,16 +299,13 @@ def log_memory_usage(device, step, phase="unknown"):
         ddp_info = f" | DDP: rank={dist.get_rank()}, world_size={dist.get_world_size()}"
 
     logging.info(
-        f"Step {step} ({phase}): GPU memory - allocated: {memory_allocated:.2f}GB, reserved: {memory_reserved:.2f}GB, free: {memory_free:.2f}GB, peak_allocated: {max_memory_allocated:.2f}GB, peak_reserved: {max_memory_reserved:.2f}GB{ddp_info}"
+        f"Step {step} ({phase}): GPU memory - allocated: {memory_allocated:.2f}GB," 
+        f"reserved: {memory_reserved:.2f}GB, free: {memory_free:.2f}GB,"
+        f"peak_allocated: {max_memory_allocated:.2f}GB, peak_reserved: {max_memory_reserved:.2f}GB{ddp_info}"
     )
 
-
-# ==========================
-# 追加ユーティリティ関数
-# ==========================
 def freeze_module(m: torch.nn.Module) -> torch.nn.Module:
     m.eval()
-    # PyTorchのバージョンによっては Module.requires_grad_ がある
     if hasattr(m, "requires_grad_"):
         m.requires_grad_(False)
     else:
@@ -478,6 +475,9 @@ def make_loss_plot_path(config, exp_checkpoint_dir: Path) -> Path:
     return "student"/ exp_checkpoint_dir / "loss_curves.png"
 
 
+# =========================
+# メイン学習ループ
+# ========================
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -502,7 +502,7 @@ def train_loop(config: _config.TrainConfig):
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
-    # experiment name から checkpoint directory を設定
+    # チェックポイントディレクトリの作成（存在しない場合のみ）
     if not resuming:
         exp_checkpoint_dir = config.checkpoint_dir
         exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -524,40 +524,35 @@ def train_loop(config: _config.TrainConfig):
     # データローダーの構築
     loader, data_config = build_datasets(config)
 
-    # Log sample images to wandb on first batch
+    # サンプルバッチの可視化とメモリ解放
     if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
+        # データローダーからサンプルバッチを取得して可視化する
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
         observation, actions = sample_batch
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
-        # Create sample images for wandb
+        # カメラビューを横に連結してwandbにログ出力する
         images_to_log = []
-        # Get batch size from the first image tensor
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
         for i in range(min(5, batch_size)):
-            # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
             img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
             img_concatenated = img_concatenated.cpu().numpy()
             images_to_log.append(wandb.Image(img_concatenated))
 
         wandb.log({"camera_views": images_to_log}, step=0)
 
-        # Clear sample batch from memory aggressively
+        # サンプルバッチとデータローダーをメモリから解放する
         del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
+        del sample_data_loader
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
 
-    # モデル構築
+    # モデル構築を設定
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
             action_dim=config.model.action_dim,
@@ -569,13 +564,9 @@ def train_loop(config: _config.TrainConfig):
         )
     else:
         model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    # ==========================
-    # 蒸留 (Shallow-π）の学習
-    # ==========================
-
+    # 教師モデルを構築（重みは後で読み込む）
     model = openpi.models_pytorch.pi0_pytorch.DistilledPI0Pytorch(model_cfg).to(device)
     assert hasattr(model_cfg, "teacher_config")
     assert hasattr(config, "pytorch_weight_path_teacher")
@@ -584,17 +575,7 @@ def train_loop(config: _config.TrainConfig):
     teacher_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(teacher_config).to(device)
     teacher_model.eval()
 
-    """
-        [重みの初期化オプション]
-
-        - オプション1（デフォルト）: teacher と蒸留用の初期重み（レイヤーをサブサンプリングしたもの）の両方に
-            pytorch_weight_path を設定する
-        - オプション2: teacher には pytorch_weight_path_teacher を設定し、
-            蒸留用の初期重みは別のものを設定する。
-            例えば、同じ teacher モデルを使い続けつつ、以前の重みから蒸留を継続することができる。
-    """
-
-    # 教師モデルを事前学習済み重みで初期化
+    # 教師モデルをファインチューニングした重みで初期化
     teacher_model_weight_path = config.pytorch_weight_path if \
         config.pytorch_weight_path_teacher is None \
             else config.pytorch_weight_path_teacher
@@ -604,11 +585,10 @@ def train_loop(config: _config.TrainConfig):
     )
     logging.info(f"教師モデルの重みを読み込みました: {teacher_model_path}")
     teacher_model = teacher_model.eval()
-    
     teacher_model = freeze_module(teacher_model)
     assert not any(p.requires_grad for p in teacher_model.parameters())
 
-
+    # gradient checkpointing をサポートしている場合は有効化（大規模モデルのメモリ最適化に有効）
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
@@ -617,38 +597,34 @@ def train_loop(config: _config.TrainConfig):
         enable_gradient_checkpointing = False
         logging.info("このモデルでは gradient checkpointing はサポートされていません")
 
-    # Log initial memory usage after model creation
+    # モデル構築後のGPUメモリ使用量をログ出力
     if is_main and torch.cuda.is_available():
+        logging.info("モデル構築後の初期GPUメモリ使用量をログ出力")
         log_memory_usage(device, 0, "after_model_creation")
 
-    # Enable memory optimizations for large-scale training
+    # DDPの設定（モデルのラッピング、メモリ最適化の有効化など）
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
-
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            static_graph=world_size >= 8,
         )
 
     # 生徒モデルを事前学習済み重みで初期化
     if config.pytorch_weight_path is not None:
         logging.info(f"重みを読み込み中: {config.pytorch_weight_path}")
-
         model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         safetensors_path=config.pytorch_weight_path
         state_dict = safetensors.torch.load_file(os.path.join(str(safetensors_path), "model.safetensors"), device="cpu")
-
         model_dict = model_to_load.state_dict()
-
         # 形状が一致するものだけをフィルタリング
         filtered_state_dict = {}
         skipped_keys = []
@@ -657,13 +633,11 @@ def train_loop(config: _config.TrainConfig):
                 filtered_state_dict[k] = v
             else:
                 skipped_keys.append(k)
-
         # レイヤーのサブサンプリングによるマッピング
         if teacher_model_weight_path == config.pytorch_weight_path:
             l_teacher = teacher_config.gemma_depth
             l_student = model_cfg.gemma_depth
             layer_mapping = torch.linspace(0, l_teacher - 1, steps=l_student).round().long().tolist()
-
             mapping_target_list = [
                 "paligemma_with_expert.gemma_expert.model.layers.",
                 "paligemma_with_expert.paligemma.model.language_model.layers.",
@@ -695,20 +669,20 @@ def train_loop(config: _config.TrainConfig):
     if resuming:
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
-
+    
+    # 学習率スケジュール関数の定義（ウォームアップ + コサイン減衰）
     def lr_schedule(step: int):
         if step < warmup_steps:
-            # JAXの挙動に合わせる: peak_lr / (warmup_steps + 1) から開始
             init_lr = peak_lr / (warmup_steps + 1)
             return init_lr + (peak_lr - init_lr) * step / warmup_steps
-        # コサイン減衰
         progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
 
+    # 学習に使用する変数を設定
     model.train()
     start_time = time.time()
-    infos = []  # ログ間隔で統計を収集
+    infos = []
     delta_loss = None
     delta_gt = None
     delta_teacher = None
@@ -750,6 +724,9 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    # -------------
+    # 学習ループ開始
+    # -------------
     while global_step < config.num_train_steps:
         # 分散学習用にエポックを設定
         if use_ddp and hasattr(loader, "set_epoch"):
@@ -760,10 +737,10 @@ def train_loop(config: _config.TrainConfig):
             if global_step >= config.num_train_steps:
                 break
 
-            # 統一されたデータローダーは (observation, actions) タプルを返す
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            # 統一されたデータローダーから (observation, actions) を取得
+            observation = jax.tree.map(lambda x: x.to(device), observation)
+            actions = actions.to(torch.float32)
+            actions = actions.to(device)
 
             # 学習率を更新
             for pg in optim.param_groups:
@@ -813,6 +790,7 @@ def train_loop(config: _config.TrainConfig):
                     }
                 )
 
+            # ログ出力と図を更新
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
@@ -832,11 +810,11 @@ def train_loop(config: _config.TrainConfig):
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
                 
-                # ---- interval平均（既存avg_loss/avg_lrに加えて）----
+                # interval平均
                 avg_loss_gt = sum(info["loss_gt"] for info in infos) / len(infos)
                 avg_loss_teacher = sum(info["loss_teacher"] for info in infos) / len(infos)
 
-                # ---- “円滑さ”の簡易指標 ----
+                # “円滑さ”の簡易指標
                 teacher_ratio = avg_loss_teacher / max(avg_loss, 1e-12)
 
                 if prev_means is not None:
@@ -844,7 +822,7 @@ def train_loop(config: _config.TrainConfig):
                     delta_gt = avg_loss_gt - prev_means["loss_gt"]
                     delta_teacher = avg_loss_teacher - prev_means["loss_teacher"]
 
-                # ---- “円滑さ”を判定 ----
+                # “円滑さ”を判定
                 status = "OK"
                 if prev_means is not None:
                     if (delta_loss is not None) and (delta_loss > 0) and (delta_gt is not None) and (delta_gt > 0):
@@ -879,8 +857,6 @@ def train_loop(config: _config.TrainConfig):
                     )
 
                 logging.info(msg)
-
-                # ---- 次回用に保存 ----
                 prev_means = {"loss": avg_loss, "loss_gt": avg_loss_gt, "loss_teacher": avg_loss_teacher}
 
                 # wandb にログを記録
@@ -896,15 +872,14 @@ def train_loop(config: _config.TrainConfig):
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
-                infos = []  # 統計の収集をリセット
-                
-                # 損失のinterval平均の確定
+                infos = []
                 means = loss_tracker.flush(global_step=global_step)
 
                 # 図を逐次更新して保存
                 if means is not None:
                     loss_tracker.save(title="Loss curves")
 
+            # config.save_interval でチェックポイントを保存
             global_step += 1
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
@@ -928,6 +903,9 @@ def train_loop(config: _config.TrainConfig):
     cleanup_ddp()
 
 
+# ========================
+# エントリーポイント
+# ========================
 def main():
     init_logging()
     config = _config.cli()

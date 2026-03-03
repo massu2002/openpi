@@ -56,19 +56,6 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
     ckpt_steps: list[int] = dataclasses.field(default_factory=lambda: [30000, 20000, 10000])
-    
-def _resolve_ckpt_dir(dir_or_template: str, train_seed: int | None) -> str:
-    """
-    dir に {seed} が含まれていれば train_seed で埋める。
-    """
-    if "{seed" in dir_or_template:
-        if train_seed is None:
-            raise ValueError(
-                "Checkpoint dir contains '{seed}' but --train_seed was not provided. "
-                "Example: --train_seed 7"
-            )
-        return dir_or_template.format(seed=train_seed)
-    return dir_or_template
 
 def _build_ckpt_dir_candidates(dir_template: str, train_seed: int | None, ckpt_steps: list[int]) -> list[str]:
     """
@@ -117,6 +104,10 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.LIBERO: Checkpoint(
         config="pi05_libero",
         dir="./checkpoints/teacher/pi05_libero/fineturne_libero/seed{seed}/{step}",
+    ),
+    EnvMode.LIBERO: Checkpoint(
+        config="pi0_libero_distill_6",
+        dir="./checkpoints/student/pi0_libero_distill_6/libero_distill_6/seed{seed}/{step}",
     ),
 }
 

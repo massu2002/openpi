@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # huggingface にログイン
-# ./.venv/bin/hf auth login --token "$HF_TOKEN"
+# ./.venv/bin/huggingface-cli login --token "$HF_TOKEN"
+# ./.venv/bin/huggingface-cli whoami
 
 # 保存先を指定して，huggingface のモデルをダウンロード
 # DEST=./checkpoints/teacher/pi05_libero
@@ -20,7 +21,7 @@ set -euo pipefail
 # 教師モデルの学習コマンド
 # ======================
 
-PEAK_LRS=(3e-6 6e-6)
+PEAK_LRS=(7e-5 3.5e-5)
 # PEAK_LRS=(2.5e-5 5e-5 1e-4)
 SEED=42
 EXP_BASE="finetune_libero"
@@ -64,15 +65,36 @@ done
 
 # 6層のモデルに蒸留
 # .venv/bin/python scripts/compute_norm_stats.py --config-name=pi0_libero_distill_6
+# peak_lr=3e-6
+# decay_lr=$(./.venv/bin/python - <<PY
+# lr=float("${peak_lr}")
+# print(lr/10.0)
+# PY
+# )
 # ./.venv/bin/python -m torch.distributed.run \
 #   --standalone --nnodes=1 --nproc_per_node=4 \
-#   scripts/distill_pytorch.py pi0_libero_distill_6 --exp_name libero_distill_6 --seed 43
+#   scripts/distill_pytorch.py pi0_libero_distill_6 \
+#   --exp_name libero_distill_6 \
+#   --seed 43 \
+#   --lr_schedule.peak_lr "${peak_lr}" \
+#   --lr_schedule.decay_lr "${decay_lr}" \
 
 
 # ======================
 # 評価コマンド
 # ======================
 
-# LIBERO評価実行コマンド
+# LIBERO評価実行コマンド（デフォルト）
 # MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 python examples/libero/main.py
 # uv run scripts/serve_policy.py --env LIBERO --train_seed 43
+
+# LIBERO評価実行コマンド（モデルと保存場所指定）
+# export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
+# MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 ./examples/libero/.venv/bin/python examples/libero/main.py \
+#   --args.result_root ./result/libero/student/pi0_libero_distill_6/libero_distill_6/seed43/30000
+# ./.venv/bin/python scripts/serve_policy.py \
+#   --env LIBERO \
+#   --port 8000 \
+#   policy:checkpoint \
+#   --policy.config pi0_libero_distill_6 \
+#   --policy.dir ./checkpoints/student/pi0_libero_distill_6/libero_distill_6/seed43/30000

@@ -21,16 +21,19 @@ class Pi0Config(_model.BaseModelConfig):
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
 
-    # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
-    max_token_len: int = None  # type: ignore
-    # Pi05 has two differences from Pi0:
-    # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
-    # - the action expert uses adaRMSNorm to inject the flow matching timestep
+    max_token_len: int = None
+    # Pi0.5（pi05=True）は Pi0 と比べて主に2つの違いがある:
+    # 1) state 入力を「連続値の suffix」として渡すのではなく
+    #    「離散化した言語トークン列の一部」として扱う
+    # 2) action expert 側で flow-matching の timestep を注入する際に
+    #    adaRMSNorm を用いる
     pi05: bool = False
-    # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
-    discrete_state_input: bool = None  # type: ignore
+    # このオプションはモデル本体で直接参照されるというより、
+    # ModelTransformFactory（前処理/変換側）が「state をどう入力に混ぜるか」を
+    # 決めるために参照するフラグ
+    discrete_state_input: bool = None
     gemma_depth: int = 18
     debug: bool = False
 
